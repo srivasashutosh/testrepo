@@ -1,0 +1,203 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+  
+  "Description" : "CloudFormation Template to provision a target environment for the rails sample app",
+  
+  "Parameters" : {
+      
+    "KeyName" : {
+      "Description" : "Name of an existing EC2 KeyPair to enable SSH access to the instances",
+      "Type" : "String",
+      "Default" : "ditc",
+      "MinLength": "1",
+      "MaxLength": "64",
+      "AllowedPattern" : "[-_ a-zA-Z0-9]*",
+      "ConstraintDescription" : "can contain only alphanumeric characters, spaces, dashes and underscores."
+    },
+
+    "InstanceType" : {
+      "Description" : "EC2 instance type",
+      "Type" : "String",
+      "Default" : "c1.medium",
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+	
+	"PrivateBucket" : {
+      "Description" : "S3 bucket for storing credentials",
+      "Type" : "String",
+      "Default" : "stelligentlabs-private",
+      "ConstraintDescription" : "Must be a valid S3 Bucket"
+    },
+	
+	"PublicBucket" : {
+	  "Description" : "S3 bucket for storing build artifacts",
+      "Type" : "String",
+      "Default" : "stelligentlabs",
+      "ConstraintDescription" : "Must be a valid S3 Bucket"
+	}
+  },
+  
+  "Mappings" : {
+    "AWSInstanceType2Arch" : {
+      "t1.micro"    : { "Arch" : "64" },
+      "m1.large"    : { "Arch" : "64" },
+      "c1.medium"   : { "Arch" : "64" }
+    },
+    "AWSRegionArch2AMI" : {
+      "us-east-1"      : { "64" : "ami-7341831a" }
+    }
+  },
+    
+  "Resources" : {     
+      
+    "CfnUser" : {
+      "Type" : "AWS::IAM::User",
+      "Properties" : {
+        "Path": "/",
+        "Policies": [{
+          "PolicyName": "root",
+          "PolicyDocument": { "Statement":[{
+            "Effect":"Allow",
+            "Action":"*",
+            "Resource":"*"
+          }
+        ]}
+       }]
+      }
+    },
+
+	"PrivateBucketPolicy" : {
+      "Type" : "AWS::S3::BucketPolicy",
+      "Properties" : {
+        "PolicyDocument": {
+          "Id":"PrivateBucketPolicy",
+          "Statement":[
+ 		    {
+              "Sid":"ReadAccess",
+	          "Action":["s3:GetObject"],
+	          "Effect":"Allow",
+	          "Resource": { "Fn::Join" : ["", ["arn:aws:s3:::", { "Ref" : "PrivateBucket" } , "/*" ]]},
+	          "Principal":{ "AWS": { "Fn::GetAtt" : [ "CfnUser", "Arn" ]} }
+            }
+		  ]
+        },
+        "Bucket" : {"Ref" : "PrivateBucket"}
+      }
+    },
+
+    "HostKeys" : {
+      "Type" : "AWS::IAM::AccessKey",
+      "Properties" : {
+        "UserName" : { "Ref": "CfnUser" }
+      }
+    },
+
+    "WebServer": {  
+      "Type": "AWS::EC2::Instance",
+ 	  "DependsOn" : "PrivateBucketPolicy",
+	  "Metadata" : {
+        "AWS::CloudFormation::Init" : {
+          "config" : {
+            "packages" : {
+              "yum" : {
+				"mysql-server" : [],
+				"mysql"        : [],
+				"ant"		   : [],
+				"tomcat6"	   : []
+              }
+            },
+
+			"files" : {
+			  "/home/ec2-user/id_rsa.pub" : {
+			   "source" : { "Fn::Join" : ["", ["https://s3.amazonaws.com/", { "Ref" : "PrivateBucket" }, "/id_rsa.pub"]]},
+               "mode"   : "000500",
+               "owner"  : "root",
+               "group"  : "root",
+			   "authentication" : "S3AccessCreds"
+              }
+			}
+          }
+        },
+		
+		"AWS::CloudFormation::Authentication" : {
+		  "S3AccessCreds" : {
+		    "type" : "S3",
+		    "accessKeyId" : { "Ref" : "HostKeys" },
+		    "secretKey" : {"Fn::GetAtt": ["HostKeys", "SecretAccessKey"]},
+		    "buckets" : [ { "Ref" : "PrivateBucket" }, { "Ref" : "PublicBucket"} ]
+		  }
+		}
+      },
+      "Properties": {
+        "ImageId" : { "Fn::FindInMap" : [ "AWSRegionArch2AMI", { "Ref" : "AWS::Region" },
+                          { "Fn::FindInMap" : [ "AWSInstanceType2Arch", { "Ref" : "InstanceType" }, "Arch" ] } ] },
+        "InstanceType"   : { "Ref" : "InstanceType" },
+        "SecurityGroups" : [ {"Ref" : "FrontendGroup"} ],
+        "KeyName"        : { "Ref" : "KeyName" },
+		"Tags" : [{ "Key" : "Name", "Value" : "Target Environment" }],
+		"UserData" : { "Fn::Base64" : { "Fn::Join" : ["", [
+		  "#!/bin/bash -v\n",
+		  "date > /home/ec2-user/starttime\n",
+          "yum update -y aws-cfn-bootstrap\n",
+
+          "# Install packages\n",
+          "/opt/aws/bin/cfn-init -s ", { "Ref" : "AWS::StackName" }, " -r WebServer ",
+          "    --access-key ",  { "Ref" : "HostKeys" },
+          "    --secret-key ", {"Fn::GetAtt": ["HostKeys", "SecretAccessKey"]},
+          "    --region ", { "Ref" : "AWS::Region" }, " || error_exit 'Failed to run cfn-init'\n",
+
+		  "service mysqld start\n",
+		  "/usr/bin/mysqladmin -u root password 'mysql'\n",
+		  "service tomcat6 start \n",
+		
+		  "# Add Public key for passwordless authentication from Jenkins Instance\n",
+		  "cat /home/ec2-user/id_rsa.pub >> /home/ec2-user/.ssh/authorized_keys\n",
+		
+		  "# Disable tty for ec2-user\n",
+		  "echo \"Defaults:%ec2-user !requiretty\" >> /etc/sudoers\n",
+		  "echo \"Defaults:ec2-user !requiretty\" >> /etc/sudoers\n",
+		
+		  "/opt/aws/bin/cfn-signal", " -e 0", " '", { "Ref" : "WaitHandle" }, "'","\n",
+
+		  "date > /home/ec2-user/stoptime"
+		]]}}
+      }
+    },
+    
+    "FrontendGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable SSH and access to Apache",
+        "SecurityGroupIngress" : [
+          {"IpProtocol" : "tcp", "FromPort" : "22", "ToPort" : "22", "CidrIp" : "0.0.0.0/0" },
+          {"IpProtocol" : "tcp", "FromPort" : "8080", "ToPort" : "8080", "CidrIp" : "0.0.0.0/0" }
+        ]
+      }      
+    },
+
+	"WaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+    
+    "WaitCondition" : {
+      "Type" : "AWS::CloudFormation::WaitCondition",
+      "DependsOn" : "WebServer",
+      "Properties" : {
+        "Handle" : { "Ref" : "WaitHandle" },
+        "Timeout" : "1200"
+      }
+    }     
+  },
+  
+  "Outputs" : {
+    "InstanceIPAddress" : {
+      "Value" : {"Fn::GetAtt": ["WebServer", "PublicDnsName"]}
+    },
+	"StackName" : {
+      "Value" : { "Ref" : "AWS::StackName" }
+    },
+    "ArtifactBucket" : {
+      "Value" : { "Ref" : "PublicBucket" }
+    }
+  }
+}
